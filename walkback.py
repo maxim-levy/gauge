@@ -6,7 +6,6 @@ from __future__ import (absolute_import, division, print_function,
 from datetime import datetime
 from decimal import Decimal
 from more_itertools import peekable
-from collections import OrderedDict
 
 import datetime
 import decimal
@@ -14,13 +13,18 @@ import argparse
 import calendar
 import logging
 import csv
-import io
-import os
 import math
 import pandas as pd
 import sys
 
+# chain onto back test simulation module
+import bt
+from bt import walkforward
+
+logging.basicConfig(level=logging.WARN)
+
 sign = lambda x: math.copysign(1, x)
+
 def round_sigfig(x, sig=5):
     if x == 0: 
         return 0 
@@ -34,14 +38,6 @@ def pgtime_to_epoch(datestring):
     1341872870
     """
     return calendar.timegm(datetime.datetime.strptime(datestring, '%Y-%m-%d %H:%M:%S').timetuple())
-
-def iso8601_to_epoch(datestring):
-    """
-    iso8601_to_epoch - convert the iso8601 date into the unix epoch time
-    >>> iso8601_to_epoch("2012-07-09T22:27:50")
-    1341872870
-    """
-    return calendar.timegm(datetime.datetime.strptime(datestring, "%Y-%m-%dT%H:%M:%S").timetuple())
 
 class pnl_tracker:
     def __init__(   self):
@@ -57,7 +53,7 @@ class pnl_tracker:
         self.previous_cost = Decimal(0.0)
         self.cost_of_transaction = Decimal(0.0)
 
-def process_order(pnl, oda):
+def process_order(pnl, oda, forward):
 
     pos_delta = oda[0]
     mtm = oda[1]
@@ -93,7 +89,9 @@ def process_order(pnl, oda):
 
     #print("cost basis {}, cost_of_trans = {} pnl.transacted_value {} pnl.cum_units {} prev_units {} mtm {} trade_in_same_direction {}".format(pnl.cost_basis,pnl.cost_of_transaction, pnl.transacted_value, pnl.cum_units, pnl.prev_units, mtm, trade_in_same_direction))
 
-def walkforward(args=None):
+    
+
+def walkbackward(args=None):
     args = parse_args(args)
 
     # prices (from influxdb)
@@ -104,7 +102,8 @@ def walkforward(args=None):
         usecols = ['Date', 'Open'],
      )
     prices = prices.set_index('Date')
-
+    prices = prices[::-1]
+ 
     # trades (from pg_executions)
     trades = pd.read_csv(
         args.data1, 
@@ -112,47 +111,31 @@ def walkforward(args=None):
         usecols = ['datetime', 'quantity', 'price', 'product'],
      )
     trades = trades.set_index('datetime')
+    trades = trades[::-1]
        
-    # funding (generally from pg_balance, but need historical data, not just most recent)
-    if os.path.isfile(args.data2):
-        funding = pd.read_csv(
-            args.data2, 
-            converters={'value': decimal.Decimal, 'created_at': pgtime_to_epoch},
-            usecols = ['created_at', 'value', 'currency'],
-        )
+    # prices (from pg_balance, but need historical data, not just most recent)
+    funding = pd.read_csv(
+        args.data2, 
+        converters={'value': decimal.Decimal, 'created_at': pgtime_to_epoch},
+        usecols = ['created_at', 'value'],
+     )
+    funding['created_at'] = pd.to_datetime(funding['created_at'], format='%Y-%m-%d %H:%M:%S').astype(int)
+    funding = funding.set_index('created_at')
+    funding = funding[::-1]
 
-        funding['created_at'] = pd.to_datetime(funding['created_at'], format='%Y-%m-%d %H:%M:%S').astype(int)
-        funding = funding.set_index('created_at')
-    else:
-        funding = pd.DataFrame()
-
-    if args.opening_balance and not args.opening_balance.is_nan():
-        funding_ccy = 'JPY' #TODO
-
-        data_dict = [{
-            'created_at':iso8601_to_epoch(args.fromdate),
-            'value':Decimal(args.opening_balance), 
-            'currency': funding_ccy
-        }]
-
-        df = pd.DataFrame.from_records(data_dict)
-        df = df.set_index('created_at')
-
-        funding = pd.concat([funding, df], sort = True)
-    
-    funding = funding[['value','currency']]
-
-    if args.fromdate:
-        fromtimestamp = iso8601_to_epoch(args.fromdate)
-        prices = prices[prices.index.searchsorted(fromtimestamp):]
-        trades = trades[trades.index.searchsorted(fromtimestamp):]
-        funding = funding[funding.index.searchsorted(fromtimestamp):]
+    realised_pnl = Decimal(0)
+    potential_pnl = Decimal(0)
 
     dit = peekable(prices.iterrows())
     oit = peekable(trades.iterrows())
     fit = peekable(funding.iterrows())
    
-    end = [sys.maxsize,0,0,5]
+    forward = False
+
+
+    end = [sys.maxsize,0,0,5] if forward else [-sys.maxsize,0,0,5]
+
+    noda = oit.peek(end)[1]
  
     data = []
     last_roi = []
@@ -164,77 +147,57 @@ def walkforward(args=None):
     od_dt = oit.peek(end)[0]
     fd_dt = fit.peek(end)[0]
 
-    realised_pnl = Decimal(0)
-    potential_pnl = Decimal(0)
     balance = Decimal(0)
 
     mtm = Decimal('Nan')
 
     event_type = []
 
-    while px_dt != end[0] or od_dt != end[0] or fd_dt != end[0]:
+    #TODO clamp how far we go back in history (maybe rely min distance, limited by CPU time)
+    
+    #while px_dt != end[0] or od_dt != end[0] or fd_dt != end[0]:
+    while od_dt != end[0] or fd_dt != end[0]:
         
-        if px_dt <= od_dt and px_dt <= fd_dt: # process market data tick
-            event_type = ['tick']
-            last_dt = px_dt
-            md = next(dit)[1]
-            px_dt = dit.peek(end)[0]
-
-            if pnl.cum_units != 0.0:
-                mtm = md[0]
-                
-                potential_pnl = (mtm - pnl.cost_basis) * pnl.cum_units
-
-                cum_pnl = realised_pnl + potential_pnl
-
-                if logging.DEBUG >= logging.root.level:                                                                                                                                                                                                                                                                             
-                    print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} previous_cost {} transacted_value {}".format(
-                        last_dt, 
-                        round_sigfig(mtm,6), 
-                        round_sigfig(pnl.potential_pnl, 3),
-                        round_sigfig(cum_pnl, 3),
-                        round_sigfig(pnl.cum_units,3), 
-                        round_sigfig(pnl.prev_units), 
-                        round_sigfig(pnl.cost_of_transaction), 
-                        round_sigfig(pnl.cum_cost), 
-                        round_sigfig(pnl.previous_cost), 
-                        round_sigfig(pnl.transacted_value),
-                        )
-                    )
-        elif od_dt <= fd_dt: # process trade
-
+        if fd_dt >= px_dt and fd_dt >= od_dt: # process cashflow
+            event_type = ['xfer']
+            # Rn = (Equity at the end of the sub-period – Equity at the beginning of the sub-period – Deposits + Withdrawals) / Equity at the beginning of the sub-period
+            
+            fd = next(fit)[1]
+            last_dt = fd_dt
+ 
+            balance += fd[0] 
+            fd_dt = fit.peek(end)[0]
+ 
+        elif od_dt >= px_dt: # process trade
             event_type = ['orda']
             noda = next(oit)[1]
             last_dt = od_dt
             od_dt = oit.peek(end)[0] 
             
-            pos_delta = noda[0]
-            assert(pos_delta != Decimal(0))
-
-            mtm = noda[1]
-            assert(mtm != Decimal(0))
+            oda_copy = noda.copy()
+            oda_copy[0] = -oda_copy[0]
+            pos_delta = oda_copy[0]
+            mtm = oda_copy[1]
 
             trade_in_same_direction = sign(pnl.cum_units + pos_delta) == sign(pnl.cum_units)
 
             if trade_in_same_direction:
-                process_order(pnl, noda)
- 
+                process_order(pnl, oda_copy, forward)
+                
                 realised_pnl += pnl.realised_pnl
                 potential_pnl = pnl.potential_pnl
-            else: # net out
-
-                oda_copy = noda.copy()
+            else:
 
                 # TODO consider reflecting closed position as cashflow
                 units_closed = -pnl.cum_units
                 units_left = pos_delta + pnl.cum_units
 
                 oda_copy[0] = units_closed
-                process_order(pnl, oda_copy)
+                process_order(pnl, oda_copy, forward)
                 realised_pnl += pnl.realised_pnl
 
                 oda_copy[0] = units_left 
-                process_order(pnl, oda_copy)
+                process_order(pnl, oda_copy, forward)
                 assert(pnl.realised_pnl == Decimal(0))
                 potential_pnl = pnl.potential_pnl
 
@@ -256,21 +219,41 @@ def walkforward(args=None):
                     round_sigfig(pnl.transacted_value),
                     round_sigfig(pos_delta,3),
                     )
-                )
-             
-        else: # process cashflow
-            event_type = ['xfer']
-            # Rn = (Equity at the end of the sub-period – Equity at the beginning of the sub-period – Deposits + Withdrawals) / Equity at the beginning of the sub-period
+            )
 
-            fd = next(fit)[1]
-            last_dt = fd_dt
+        else:
+            event_type = ['tick']
+ 
+            last_dt = px_dt
+            md = next(dit)[1]
+            px_dt = dit.peek(end)[0]
 
-            balance += fd[0]
-            fd_dt = fit.peek(end)[0]
+            if pnl.cum_units != 0.0:
+                mtm = md[0]
+                
+                #value = abs(pnl.cum_units) * mtm
+                #potential_pnl = value + abs(pnl.cum_cost)
 
-        next_dt = min(px_dt, od_dt, fd_dt)
+                cum_pnl = realised_pnl + potential_pnl
+                                                                                                                                                                                                                                                                                                        
+                if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
+                    print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} previous_cost {} transacted_value {}".format(
+                        last_dt, 
+                        round_sigfig(mtm,6), 
+                        round_sigfig(cum_pnl / abs(pnl.cum_units),3) if pnl.cum_units != 0 else 0,
+                        round_sigfig(cum_pnl, 3),
+                        round_sigfig(pnl.cum_units,3), 
+                        round_sigfig(pnl.prev_units), 
+                        round_sigfig(pnl.cost_of_transaction), 
+                        round_sigfig(pnl.cum_cost), 
+                        round_sigfig(pnl.previous_cost), 
+                        round_sigfig(pnl.transacted_value),
+                        )
+                    )
 
-        if last_dt < next_dt: # close of timepoint
+        next_dt = max(px_dt, od_dt, fd_dt)
+
+        if last_dt > next_dt: # close of timepoint
 
             account_value = balance + realised_pnl + potential_pnl
 
@@ -284,7 +267,7 @@ def walkforward(args=None):
                 last_roi = [] + roi #induce copy
 
             last_dt = next_dt
-    
+        
         #         r_est = (emv - bmv - balance_adj)/(bmv + balance_adj)
         #         print (bmv + balance_adj*(1 + r_est))
         #         r_est = (emv - bmv - balance_adj*(1+r_est) - balance_adj*(1+r_est)*r_est) / (bmv + balance_adj*(1 + r_est))
@@ -293,22 +276,22 @@ def walkforward(args=None):
 
         #         print("cash {} r_est {} bmv {} emv {}".format(last_dt, r_est*100, bmv, emv))
                 
+    data.reverse()
+    opening_balance = data[0][7]
+    opening_date = data[0][0]
 
-    if args.writer: 
-        os.makedirs(os.path.dirname(args.csv), exist_ok=True)
-        with open(args.csv, 'w', newline='') as csvfile:
-            pnlwriter = csv.writer(csvfile, delimiter='\t', 
-                        quotechar='|', quoting=csv.QUOTE_MINIMAL)
-            pnlwriter.writerow(["Date", "Price", "Cost Basis", "NOP", "Realised Pnl", "Potential Pnl", "Balance", "Account Value"])
-            for x in data:
-                pnlwriter.writerow(x)
-        print("wrote report {}".format(csvfile))
+    new_args = [] + sys.argv[1:] \
+        + ["--opening_balance",str(opening_balance)] \
+        + ["--fromdate",datetime.datetime.utcfromtimestamp(opening_date).isoformat()]
+
+    walkforward(new_args)
 
     # perf = df['Returns'].calc_stats() 
     # perf.display() 
     # print(perf)   
     # perf.plot()  
             
+
 
 def parse_args(pargs=None):
     parser = argparse.ArgumentParser(
@@ -340,7 +323,7 @@ def parse_args(pargs=None):
     #     import_from_quoine_main.pg_balances 
     # where 
     #     user_id = 401130    
-    parser.add_argument('--data2', default='sample/pg_balances.in.csv',
+    parser.add_argument('--data2', default='sample/pg_balances.rev.in.csv',
                         required=False, help='Data to read in')
 
     # Defaults for dates
@@ -352,6 +335,9 @@ def parse_args(pargs=None):
 
     parser.add_argument('--order-history', required=False, action='store_true',
                         help='use order history')
+
+    parser.add_argument('--cerebro', required=False, default='',
+                        metavar='kwargs', help='kwargs in key=value format')
 
     parser.add_argument('--broker', required=False, default='',
                         metavar='kwargs', help='kwargs in key=value format')
@@ -366,9 +352,6 @@ def parse_args(pargs=None):
                         nargs='?', const='{}',
                         metavar='kwargs', help='kwargs in key=value format')
 
-    parser.add_argument('--opening_balance', type=Decimal, required=False, default='Nan',
-                        help='Real number')
-
     # parser.add_argument('--timeframe', default='minutes', required=False,
     #                     choices=['ticks', 'microseconds', 'seconds',
     #                              'minutes', 'daily', 'weekly', 'monthly'],
@@ -380,15 +363,11 @@ def parse_args(pargs=None):
     parser.add_argument('--writer', required=False, action='store_true',
                         help=('Add a Writer'))
 
-    parser.add_argument('--csv', default='output/report.csv', required=False,
-                        help=('Output to csv'))
-
     return parser.parse_args(pargs)
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.WARN)
-    walkforward()
+    walkbackward()
 
 
 
