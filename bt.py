@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8; py-indent-offset:4 -*-
+"""Simulate trading performance with reference to external trade history. 
+
+Starting from a historical snapshot of account value and open positions, we walk forward in time and replay market events to reconstruct the trader's pnl profile.
+https://en.wikipedia.org/wiki/Walk_forward_optimization
+"""
+
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 from datetime import datetime
 from decimal import Decimal
 from more_itertools import peekable
-from collections import OrderedDict
 
 import datetime
 import decimal
@@ -19,6 +24,15 @@ import os
 import math
 import pandas as pd
 import sys
+
+__author__ = "Mark Hammond"
+__copyright__ = "Copyright 2019, Quoine Financial"
+__credits__ = ["Mark Hammond"]
+__license__ = "None"
+__version__ = "0.0.1"
+__maintainer__ = "Mark Hammond"
+__email__ = "mark@quoine.com"
+__status__ = "Development"
 
 sign = lambda x: math.copysign(1, x)
 def round_sigfig(x, sig=5):
@@ -46,15 +60,12 @@ def iso8601_to_epoch(datestring):
 class pnl_tracker:
     def __init__(   self):
         self.potential_pnl = Decimal(0.0)
-        self.buy = 0
-        self.sell = 0
         self.cum_cost = Decimal(0.0)
         self.cost_basis = Decimal(0.0)
         self.realised_pnl = Decimal(0.0)
         self.prev_units = Decimal(0.0)
         self.cum_units = Decimal(0.0)
         self.transacted_value = Decimal(0.0)
-        self.previous_cost = Decimal(0.0)
         self.cost_of_transaction = Decimal(0.0)
 
 def process_order(pnl, oda):
@@ -66,7 +77,6 @@ def process_order(pnl, oda):
     pnl.cum_units += pos_delta
 
     fees = Decimal(0.0)
-    pnl.previous_cost = Decimal(pnl.cum_cost)
 
     trade_in_same_direction = sign(pnl.prev_units) == sign(pnl.cum_units)
     increase_position = abs(pnl.cum_units) > abs(pnl.prev_units)
@@ -127,7 +137,9 @@ def walkforward(args=None):
         funding = pd.DataFrame()
 
     if args.opening_balance and not args.opening_balance.is_nan():
-        funding_ccy = 'JPY' #TODO
+        funding_ccy = 'JPY' 
+        #TODO handle difference currencies
+        #TODO convert to portfolio currency
 
         data_dict = [{
             'created_at':iso8601_to_epoch(args.fromdate),
@@ -147,6 +159,12 @@ def walkforward(args=None):
         prices = prices[prices.index.searchsorted(fromtimestamp):]
         trades = trades[trades.index.searchsorted(fromtimestamp):]
         funding = funding[funding.index.searchsorted(fromtimestamp):]
+
+    if args.todate:
+        totimestamp = iso8601_to_epoch(args.todate)
+        prices = prices[:prices.index.searchsorted(totimestamp)]
+        trades = trades[:trades.index.searchsorted(totimestamp)]
+        funding = funding[:funding.index.searchsorted(totimestamp)]
 
     dit = peekable(prices.iterrows())
     oit = peekable(trades.iterrows())
@@ -188,7 +206,7 @@ def walkforward(args=None):
                 cum_pnl = realised_pnl + potential_pnl
 
                 if logging.DEBUG >= logging.root.level:                                                                                                                                                                                                                                                                             
-                    print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} previous_cost {} transacted_value {}".format(
+                    print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} transacted_value {}".format(
                         last_dt, 
                         round_sigfig(mtm,6), 
                         round_sigfig(pnl.potential_pnl, 3),
@@ -197,7 +215,6 @@ def walkforward(args=None):
                         round_sigfig(pnl.prev_units), 
                         round_sigfig(pnl.cost_of_transaction), 
                         round_sigfig(pnl.cum_cost), 
-                        round_sigfig(pnl.previous_cost), 
                         round_sigfig(pnl.transacted_value),
                         )
                     )
@@ -241,7 +258,7 @@ def walkforward(args=None):
             cum_pnl = realised_pnl + potential_pnl
  
             if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
-                print("oda {} px {} adj_pnl {:f} cum_pnl {} cum_units {:f} real {} potential {} prev_units {:f} cost_of_transaction {} cum_cost {} previous_cost {} transacted_value {} pos_delta {:f}".format(
+                print("oda {} px {} adj_pnl {:f} cum_pnl {} cum_units {:f} real {} potential {} prev_units {:f} cost_of_transaction {} cum_cost {} transacted_value {} pos_delta {:f}".format(
                     last_dt, 
                     round_sigfig(mtm,6),
                     round_sigfig(cum_pnl / abs(pnl.cum_units)) if pnl.cum_units != 0 else 0,
@@ -252,7 +269,6 @@ def walkforward(args=None):
                     round_sigfig(pnl.prev_units,3), 
                     round_sigfig(pnl.cost_of_transaction), 
                     round_sigfig(pnl.cum_cost), 
-                    round_sigfig(pnl.previous_cost), 
                     round_sigfig(pnl.transacted_value),
                     round_sigfig(pos_delta,3),
                     )
@@ -292,7 +308,6 @@ def walkforward(args=None):
         #         r_est = (emv - bmv - balance_adj*(1+r_est) - balance_adj*(1+r_est)*r_est) / (bmv + balance_adj*(1 + r_est))
 
         #         print("cash {} r_est {} bmv {} emv {}".format(last_dt, r_est*100, bmv, emv))
-                
 
     if args.writer: 
         os.makedirs(os.path.dirname(args.csv), exist_ok=True)
@@ -304,6 +319,8 @@ def walkforward(args=None):
                 pnlwriter.writerow(x)
         print("wrote report {}".format(csvfile))
 
+    return data[-1]
+
     # perf = df['Returns'].calc_stats() 
     # perf.display() 
     # print(perf)   
@@ -314,7 +331,7 @@ def parse_args(pargs=None):
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            'Order History Sample'
+            'Walk-forward historical simulation'
         )
     )
 
@@ -350,18 +367,6 @@ def parse_args(pargs=None):
     parser.add_argument('--todate', required=False, default='',
                         help='Date[time] in YYYY-MM-DD[THH:MM:SS] format')
 
-    parser.add_argument('--order-history', required=False, action='store_true',
-                        help='use order history')
-
-    parser.add_argument('--broker', required=False, default='',
-                        metavar='kwargs', help='kwargs in key=value format')
-
-    parser.add_argument('--sizer', required=False, default='',
-                        metavar='kwargs', help='kwargs in key=value format')
-
-    parser.add_argument('--strat', required=False, default='',
-                        metavar='kwargs', help='kwargs in key=value format')
-
     parser.add_argument('--plot', required=False, default='',
                         nargs='?', const='{}',
                         metavar='kwargs', help='kwargs in key=value format')
@@ -388,6 +393,7 @@ def parse_args(pargs=None):
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.WARN)
+
     walkforward()
 
 

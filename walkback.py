@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8; py-indent-offset:4 -*-
+"""Simulate trading performance with reference to external trade history using walk-backward strategy
+https://en.wikipedia.org/wiki/Walk_forward_optimization
+
+Starting with a recent snaphot of account value and open positions, we walk backwards in time, replaying market events to reconstruct the trader's pnl profile.
+
+FIXME fixup todate and fromdate handling to limit how far we go back in history (maybe rely min distance, limited by CPU time)
+    
+"""
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
@@ -7,17 +15,27 @@ from datetime import datetime
 from decimal import Decimal
 from more_itertools import peekable
 
+import bisect
 import datetime
 import decimal
 import argparse
 import calendar
 import logging
 import csv
+import os
 import math
 import pandas as pd
 import sys
 
-# chain onto back test simulation module
+__author__ = "Mark Hammond"
+__copyright__ = "Copyright 2019, Quoine Financial"
+__credits__ = ["Mark Hammond"]
+__license__ = "None"
+__version__ = "0.0.1"
+__maintainer__ = "Mark Hammond"
+__email__ = "mark@quoine.com"
+__status__ = "Development"
+
 import bt
 from bt import walkforward
 
@@ -39,21 +57,32 @@ def pgtime_to_epoch(datestring):
     """
     return calendar.timegm(datetime.datetime.strptime(datestring, '%Y-%m-%d %H:%M:%S').timetuple())
 
+def iso8601_to_epoch(datestring):
+    """
+    iso8601_to_epoch - convert the iso8601 date into the unix epoch time
+    >>> iso8601_to_epoch("2012-07-09T22:27:50")
+    1341872870
+    """
+    return calendar.timegm(datetime.datetime.strptime(datestring, "%Y-%m-%dT%H:%M:%S").timetuple())
+
+def normalize_decimal(d):
+    try:
+        return d.normalize()
+    except (AttributeError, ValueError, TypeError):
+        return d
+
 class pnl_tracker:
     def __init__(   self):
         self.potential_pnl = Decimal(0.0)
-        self.buy = 0
-        self.sell = 0
         self.cum_cost = Decimal(0.0)
         self.cost_basis = Decimal(0.0)
         self.realised_pnl = Decimal(0.0)
         self.prev_units = Decimal(0.0)
         self.cum_units = Decimal(0.0)
         self.transacted_value = Decimal(0.0)
-        self.previous_cost = Decimal(0.0)
         self.cost_of_transaction = Decimal(0.0)
 
-def process_order(pnl, oda, forward):
+def process_order(pnl, oda):
 
     pos_delta = oda[0]
     mtm = oda[1]
@@ -62,7 +91,6 @@ def process_order(pnl, oda, forward):
     pnl.cum_units += pos_delta
 
     fees = Decimal(0.0)
-    pnl.previous_cost = Decimal(pnl.cum_cost)
 
     trade_in_same_direction = sign(pnl.prev_units) == sign(pnl.cum_units)
     increase_position = abs(pnl.cum_units) > abs(pnl.prev_units)
@@ -130,13 +158,14 @@ def walkbackward(args=None):
     oit = peekable(trades.iterrows())
     fit = peekable(funding.iterrows())
    
-    forward = False
+    if args.fromdate:
+        fromtimestamp = iso8601_to_epoch(args.fromdate)
+        prices = prices[prices.index.searchsorted(fromtimestamp):]
+        trades = trades[trades.index.searchsorted(fromtimestamp):]
+        funding = funding[funding.index.searchsorted(fromtimestamp):]
+    
+    end = [-sys.maxsize,0,0,5]
 
-
-    end = [sys.maxsize,0,0,5] if forward else [-sys.maxsize,0,0,5]
-
-    noda = oit.peek(end)[1]
- 
     data = []
     last_roi = []
 
@@ -153,8 +182,6 @@ def walkbackward(args=None):
 
     event_type = []
 
-    #TODO clamp how far we go back in history (maybe rely min distance, limited by CPU time)
-    
     #while px_dt != end[0] or od_dt != end[0] or fd_dt != end[0]:
     while od_dt != end[0] or fd_dt != end[0]:
         
@@ -182,7 +209,7 @@ def walkbackward(args=None):
             trade_in_same_direction = sign(pnl.cum_units + pos_delta) == sign(pnl.cum_units)
 
             if trade_in_same_direction:
-                process_order(pnl, oda_copy, forward)
+                process_order(pnl, oda_copy)
                 
                 realised_pnl += pnl.realised_pnl
                 potential_pnl = pnl.potential_pnl
@@ -193,18 +220,18 @@ def walkbackward(args=None):
                 units_left = pos_delta + pnl.cum_units
 
                 oda_copy[0] = units_closed
-                process_order(pnl, oda_copy, forward)
+                process_order(pnl, oda_copy)
                 realised_pnl += pnl.realised_pnl
 
                 oda_copy[0] = units_left 
-                process_order(pnl, oda_copy, forward)
+                process_order(pnl, oda_copy)
                 assert(pnl.realised_pnl == Decimal(0))
                 potential_pnl = pnl.potential_pnl
 
             cum_pnl = realised_pnl + potential_pnl
  
             if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
-                print("oda {} px {} adj_pnl {:f} cum_pnl {} cum_units {:f} real {} potential {} prev_units {:f} cost_of_transaction {} cum_cost {} previous_cost {} transacted_value {} pos_delta {:f}".format(
+                print("oda {} px {} adj_pnl {:f} cum_pnl {} cum_units {:f} real {} potential {} prev_units {:f} cost_of_transaction {} cum_cost {} transacted_value {} pos_delta {:f}".format(
                     last_dt, 
                     round_sigfig(mtm,6),
                     round_sigfig(cum_pnl / abs(pnl.cum_units)) if pnl.cum_units != 0 else 0,
@@ -215,7 +242,6 @@ def walkbackward(args=None):
                     round_sigfig(pnl.prev_units,3), 
                     round_sigfig(pnl.cost_of_transaction), 
                     round_sigfig(pnl.cum_cost), 
-                    round_sigfig(pnl.previous_cost), 
                     round_sigfig(pnl.transacted_value),
                     round_sigfig(pos_delta,3),
                     )
@@ -231,13 +257,12 @@ def walkbackward(args=None):
             if pnl.cum_units != 0.0:
                 mtm = md[0]
                 
-                #value = abs(pnl.cum_units) * mtm
-                #potential_pnl = value + abs(pnl.cum_cost)
+                potential_pnl = (mtm - pnl.cost_basis) * pnl.cum_units
 
                 cum_pnl = realised_pnl + potential_pnl
                                                                                                                                                                                                                                                                                                         
                 if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
-                    print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} previous_cost {} transacted_value {}".format(
+                    print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} transacted_value {}".format(
                         last_dt, 
                         round_sigfig(mtm,6), 
                         round_sigfig(cum_pnl / abs(pnl.cum_units),3) if pnl.cum_units != 0 else 0,
@@ -246,7 +271,6 @@ def walkbackward(args=None):
                         round_sigfig(pnl.prev_units), 
                         round_sigfig(pnl.cost_of_transaction), 
                         round_sigfig(pnl.cum_cost), 
-                        round_sigfig(pnl.previous_cost), 
                         round_sigfig(pnl.transacted_value),
                         )
                     )
@@ -257,13 +281,13 @@ def walkbackward(args=None):
 
             account_value = balance + realised_pnl + potential_pnl
 
-            roi = [realised_pnl, potential_pnl, balance, account_value]
+            roi = [normalize_decimal(realised_pnl), normalize_decimal(potential_pnl), normalize_decimal(balance), normalize_decimal(account_value)]
 
             if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
                 print("roi {} next_roi {} balance {} unrealised {}".format(roi, last_roi, balance, Decimal(abs(pnl.cum_units) * mtm)))
             
             if roi != last_roi or event_type == ['orda']:
-                data.append([last_dt, mtm, pnl.cost_basis, pnl.cum_units] + roi)
+                data.append([last_dt, mtm, normalize_decimal(pnl.cost_basis), normalize_decimal(pnl.cum_units)] + roi)
                 last_roi = [] + roi #induce copy
 
             last_dt = next_dt
@@ -275,16 +299,39 @@ def walkbackward(args=None):
         #         r_est = (emv - bmv - balance_adj*(1+r_est) - balance_adj*(1+r_est)*r_est) / (bmv + balance_adj*(1 + r_est))
 
         #         print("cash {} r_est {} bmv {} emv {}".format(last_dt, r_est*100, bmv, emv))
-                
-    data.reverse()
-    opening_balance = data[0][7]
-    opening_date = data[0][0]
+
+    if args.todate:
+        totimestamp = iso8601_to_epoch(args.todate)
+        keys = [r[0] for r in data] 
+        i = bisect.bisect_left(keys, totimestamp)
+        data = data[:i]
+
+    opening_balance = data[-1][7]
+    opening_date = data[-1][0]
 
     new_args = [] + sys.argv[1:] \
         + ["--opening_balance",str(opening_balance)] \
         + ["--fromdate",datetime.datetime.utcfromtimestamp(opening_date).isoformat()]
 
-    walkforward(new_args)
+    bk_data = [normalize_decimal(d) for d in data[0]]
+    #data.reverse() 
+
+    fw_data = walkforward(new_args)
+    fw_data = [normalize_decimal(d) for d in fw_data]
+
+    success = True
+
+    one_percent = 0.01
+    consistent_simulation = math.isclose(bk_data[-1], fw_data[-1], rel_tol = one_percent)
+
+    if not consistent_simulation:
+        print("Backward and forward walk are inconsistent {} vs. {}".format(bk_data[-1], fw_data[-1]))
+        print("Backward walk {}".format(bk_data))
+        print("Forward walk {}".format(fw_data))
+
+        return not success
+
+    return success
 
     # perf = df['Returns'].calc_stats() 
     # perf.display() 
@@ -297,7 +344,7 @@ def parse_args(pargs=None):
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            'Order History Sample'
+            'Walk-backward historical simulation'
         )
     )
 
@@ -333,21 +380,6 @@ def parse_args(pargs=None):
     parser.add_argument('--todate', required=False, default='',
                         help='Date[time] in YYYY-MM-DD[THH:MM:SS] format')
 
-    parser.add_argument('--order-history', required=False, action='store_true',
-                        help='use order history')
-
-    parser.add_argument('--cerebro', required=False, default='',
-                        metavar='kwargs', help='kwargs in key=value format')
-
-    parser.add_argument('--broker', required=False, default='',
-                        metavar='kwargs', help='kwargs in key=value format')
-
-    parser.add_argument('--sizer', required=False, default='',
-                        metavar='kwargs', help='kwargs in key=value format')
-
-    parser.add_argument('--strat', required=False, default='',
-                        metavar='kwargs', help='kwargs in key=value format')
-
     parser.add_argument('--plot', required=False, default='',
                         nargs='?', const='{}',
                         metavar='kwargs', help='kwargs in key=value format')
@@ -363,11 +395,17 @@ def parse_args(pargs=None):
     parser.add_argument('--writer', required=False, action='store_true',
                         help=('Add a Writer'))
 
+    parser.add_argument('--csv', default='output/report.csv', required=False,
+                        help=('Output to csv'))
+
     return parser.parse_args(pargs)
 
 
 if __name__ == '__main__':
-    walkbackward()
+    logging.basicConfig(level=logging.WARN)
+
+    if not walkbackward():
+        sys.exit(os.EX_SOFTWARE)
 
 
 
