@@ -4,6 +4,9 @@
 
 Starting from a historical snapshot of account value and open positions, we walk forward in time and replay market events to reconstruct the trader's pnl profile.
 https://en.wikipedia.org/wiki/Walk_forward_optimization
+
+FIXME correct mark-to-market (mtm) by using price by size
+FIXME convert pnl to portfolio currency using correct fx conversion rate
 """
 
 from __future__ import (absolute_import, division, print_function,
@@ -20,6 +23,7 @@ import calendar
 import logging
 import csv
 import io
+import json
 import os
 import math
 import pandas as pd
@@ -38,6 +42,8 @@ sign = lambda x: math.copysign(1, x)
 def round_sigfig(x, sig=5):
     if x == 0: 
         return 0 
+    elif x.is_nan():
+        return Decimal('Nan')
     else:
         return round(x, sig-int(math.floor(math.log10(abs(x))))-1)     
 
@@ -57,22 +63,39 @@ def iso8601_to_epoch(datestring):
     """
     return calendar.timegm(datetime.datetime.strptime(datestring, "%Y-%m-%dT%H:%M:%S").timetuple())
 
+
+class perf_ohlc:
+    def __init__(   self):
+        self.pnl_open = Decimal(0.0)
+        self.pnl_high = Decimal(0.0)
+        self.pnl_low = Decimal(0.0)
+        self.pnl_close = Decimal(0.0)
+        self.px_open = Decimal(0.0)
+        self.px_high = Decimal(0.0)
+        self.px_low = Decimal(0.0)
+        self.px_close = Decimal(0.0)
+
 class pnl_tracker:
     def __init__(   self):
+        self.mtm = Decimal('Nan')
         self.potential_pnl = Decimal(0.0)
         self.cum_cost = Decimal(0.0)
-        self.cost_basis = Decimal(0.0)
+        self.cost_basis = Decimal('Nan')
         self.realised_pnl = Decimal(0.0)
         self.prev_units = Decimal(0.0)
         self.cum_units = Decimal(0.0)
         self.transacted_value = Decimal(0.0)
         self.cost_of_transaction = Decimal(0.0)
+        self.cum_pnl = Decimal(0.0)
+        self.unit_ccy = str()
+        self.pnl_ccy = str()
 
 def process_order(pnl, oda):
 
     pos_delta = oda[0]
-    mtm = oda[1]
-            
+    pnl.mtm = oda[1]
+    assert(pnl.mtm != Decimal(0) and not pnl.mtm.is_nan())
+
     pnl.prev_units = pnl.cum_units
     pnl.cum_units += pos_delta
 
@@ -84,34 +107,46 @@ def process_order(pnl, oda):
     pnl.transacted_value = pos_delta * pnl.cost_basis - fees
 
     if pnl.prev_units == 0:
-        pnl.cost_basis = mtm #Decimal(0)
+        pnl.cost_basis = pnl.mtm #Decimal(0)
     elif trade_in_same_direction: 
         if increase_position:
-            pnl.cost_basis = (pnl.cost_basis * abs(pnl.prev_units) + mtm * abs(pos_delta)) / abs(pnl.cum_units)
+            pnl.cost_basis = (pnl.cost_basis * abs(pnl.prev_units) + pnl.mtm * abs(pos_delta)) / abs(pnl.cum_units)
         # else: #do nothing
     else:
-        pnl.cost_basis = mtm
+        pnl.cost_basis = pnl.mtm
 
-    pnl.cost_of_transaction = pos_delta * mtm + fees
+    pnl.cost_of_transaction = pos_delta * pnl.mtm + fees
 
     if abs(pnl.cum_units) < abs(pnl.prev_units):
-        pnl.realised_pnl =  pnl.transacted_value - pnl.cost_of_transaction
+        pnl.realised_pnl += pnl.transacted_value - pnl.cost_of_transaction
     else:
-        pnl.realised_pnl = 0
+        pnl.realised_pnl += 0
    
-    pnl.potential_pnl = (pnl.cost_basis - mtm) * pnl.cum_units - fees
+    pnl.potential_pnl = (pnl.cost_basis - pnl.mtm) * pnl.cum_units - fees
 
+    pnl.cum_pnl = pnl.realised_pnl + pnl.potential_pnl
+
+    if pnl.cum_units == Decimal(0):
+        pnl.cost_basis = Decimal('Nan')
+ 
     #print("cost basis {}, cost_of_trans = {} pnl.transacted_value {} pnl.cum_units {} prev_units {} mtm {} trade_in_same_direction {}".format(pnl.cost_basis,pnl.cost_of_transaction, pnl.transacted_value, pnl.cum_units, pnl.prev_units, mtm, trade_in_same_direction))
 
 def walkforward(args=None):
     args = parse_args(args)
+
+    # FIXME make data driven
+    portfolio_ccy = args.portfolio_ccy
+
+    product_static = dict()
+    with open(args.product_static_json, encoding='utf-8') as data_file:
+        product_static = json.loads(data_file.read())
 
     # prices (from influxdb)
     # ... we'll sample ladders and use ~10 levels of depth to calculate mark-to-market
     prices = pd.read_csv(
         args.data0, 
         converters={'Date': int, 'Open': decimal.Decimal},
-        usecols = ['Date', 'Open'],
+        usecols = ['Date', 'Open', 'Product'],
      )
     prices = prices.set_index('Date')
 
@@ -119,16 +154,19 @@ def walkforward(args=None):
     trades = pd.read_csv(
         args.data1, 
         converters={'datetime': int, 'price': decimal.Decimal, 'quantity': decimal.Decimal},
-        usecols = ['datetime', 'quantity', 'price', 'product'],
+        usecols = ['datetime', 'quantity', 'price', 'product']
+        #user_id', 'quantity', 'price', 'product', 'product_type', 'base_ccy', 'quoted_ccy'],
      )
     trades = trades.set_index('datetime')
        
+    #trades = trades[['quantity','price','product','product_type','base_ccy','quoted_ccy']]
+
     # funding (generally from pg_balance, but need historical data, not just most recent)
     if os.path.isfile(args.data2):
         funding = pd.read_csv(
             args.data2, 
             converters={'value': decimal.Decimal, 'created_at': pgtime_to_epoch},
-            usecols = ['created_at', 'value', 'currency'],
+            usecols = ['created_at', 'currency', 'value'],
         )
 
         funding['created_at'] = pd.to_datetime(funding['created_at'], format='%Y-%m-%d %H:%M:%S').astype(int)
@@ -136,23 +174,20 @@ def walkforward(args=None):
     else:
         funding = pd.DataFrame()
 
-    if args.opening_balance and not args.opening_balance.is_nan():
-        funding_ccy = 'JPY' 
-        #TODO handle difference currencies
-        #TODO convert to portfolio currency
+    if args.opening_balance:
+        for funding_ccy, quantity in args.opening_balance.items():
+            data_dict = [{
+                'created_at': iso8601_to_epoch(args.fromdate),
+                'currency': funding_ccy,
+                'value': Decimal(quantity), 
+            }]
 
-        data_dict = [{
-            'created_at':iso8601_to_epoch(args.fromdate),
-            'value':Decimal(args.opening_balance), 
-            'currency': funding_ccy
-        }]
+            df = pd.DataFrame.from_records(data_dict)
+            df = df.set_index('created_at')
 
-        df = pd.DataFrame.from_records(data_dict)
-        df = df.set_index('created_at')
-
-        funding = pd.concat([funding, df], sort = True)
+            funding = pd.concat([funding, df], sort = True)
     
-    funding = funding[['value','currency']]
+    funding = funding[['currency','value']]
 
     if args.fromdate:
         fromtimestamp = iso8601_to_epoch(args.fromdate)
@@ -173,133 +208,285 @@ def walkforward(args=None):
     end = [sys.maxsize,0,0,5]
  
     data = []
+    balance_data = []
     last_roi = []
 
-    pnl = pnl_tracker()
-
+    #first_dt = 0
     last_dt = 0
     px_dt = dit.peek(end)[0]
     od_dt = oit.peek(end)[0]
     fd_dt = fit.peek(end)[0]
 
-    realised_pnl = Decimal(0)
-    potential_pnl = Decimal(0)
-    balance = Decimal(0)
+    asset = dict()
 
-    mtm = Decimal('Nan')
+    product_perf = dict()
+    product_ohlc = dict()
+    portfolio_open = Decimal(0)
+    portfolio_high = Decimal(0)
+    portfolio_low = Decimal(0)
+    portfolio_close = Decimal(0)
 
-    event_type = []
+    last_bar = 0
 
     while px_dt != end[0] or od_dt != end[0] or fd_dt != end[0]:
         
         if px_dt <= od_dt and px_dt <= fd_dt: # process market data tick
-            event_type = ['tick']
+            # event_type = ['tick']
             last_dt = px_dt
+
             md = next(dit)[1]
             px_dt = dit.peek(end)[0]
+                        
+            product_id = md[1]  
+            assert (product_id)
 
-            if pnl.cum_units != 0.0:
-                mtm = md[0]
-                
-                potential_pnl = (mtm - pnl.cost_basis) * pnl.cum_units
+            if product_id in product_perf:
+       
+                p_pnl = product_perf[product_id]
+                if p_pnl.cum_units != 0:
+                    #FIXME improve accuracy by looking up price by size market data feed
+                    #methodology must be consistent with walk backward
+                    mtm = md[0]
+                    p_pnl.mtm = mtm
+                        
+                    if p_pnl.pnl_ccy == portfolio_ccy:
+                        portfolio_close -= p_pnl.cum_pnl
+                    else:
+                        # FIXME
+                        # use fx conversion rate to convert p_pnl.cum_pnl from p_pnl.pnl_ccy to portfolio_ccy
+                        fx_conv_rate = Decimal(1.0)
+                        portfolio_close -= fx_conv_rate * p_pnl.cum_pnl
 
-                cum_pnl = realised_pnl + potential_pnl
+                    p_pnl.potential_pnl = (p_pnl.mtm - p_pnl.cost_basis) * p_pnl.cum_units
+                    p_pnl.cum_pnl = p_pnl.realised_pnl + p_pnl.potential_pnl             
 
-                if logging.DEBUG >= logging.root.level:                                                                                                                                                                                                                                                                             
-                    print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} transacted_value {}".format(
-                        last_dt, 
-                        round_sigfig(mtm,6), 
-                        round_sigfig(pnl.potential_pnl, 3),
-                        round_sigfig(cum_pnl, 3),
-                        round_sigfig(pnl.cum_units,3), 
-                        round_sigfig(pnl.prev_units), 
-                        round_sigfig(pnl.cost_of_transaction), 
-                        round_sigfig(pnl.cum_cost), 
-                        round_sigfig(pnl.transacted_value),
+                    cum_pnl = p_pnl.cum_pnl
+
+                    if product_id in product_ohlc:
+                        ohlc = product_ohlc[product_id]
+                        ohlc.pnl_high = max(ohlc.pnl_high, cum_pnl)
+                        ohlc.pnl_low = min(ohlc.pnl_low, cum_pnl)
+                        ohlc.pnl_close = cum_pnl
+
+                        ohlc.px_high = max(ohlc.px_high, mtm)
+                        ohlc.px_low = min(ohlc.px_low, mtm)
+                        ohlc.px_close = mtm
+                    else:       
+                        product_ohlc[product_id] = perf_ohlc()
+                        ohlc = product_ohlc[product_id]
+                        ohlc.pnl_open = cum_pnl
+                        ohlc.pnl_high = cum_pnl
+                        ohlc.pnl_low = cum_pnl
+                        ohlc.pnl_close = cum_pnl  
+
+                        ohlc.px_open = mtm
+                        ohlc.px_high = mtm
+                        ohlc.px_low = mtm
+                        ohlc.px_close = mtm
+
+                    if p_pnl.pnl_ccy == portfolio_ccy:
+                        portfolio_close += p_pnl.cum_pnl
+                    else:
+                        # FIXME
+                        # use fx conversion rate to convert p_pnl.cum_pnl from p_pnl.pnl_ccy to portfolio_ccy
+                        fx_conv_rate = Decimal(1.0)
+                        portfolio_close += fx_conv_rate * p_pnl.cum_pnl
+
+                    portfolio_low = min(portfolio_low, portfolio_close)
+                    portfolio_high = max(portfolio_high, portfolio_close)
+
+                    if logging.DEBUG >= logging.root.level:                                                                                                                                                                                                                                                                             
+                        print("mkt {} px {} adj_pnl {} cum_pnl {} cum_units {:f} prev_units {} cost_of_transaction {} cum_cost {} transacted_value {}".format(
+                            last_dt, 
+                            round_sigfig(p_pnl.mtm, 6), 
+                            round_sigfig(p_pnl.potential_pnl, 3),
+                            round_sigfig(cum_pnl, 3),
+                            round_sigfig(p_pnl.cum_units, 3), 
+                            round_sigfig(p_pnl.prev_units), 
+                            round_sigfig(p_pnl.cost_of_transaction), 
+                            round_sigfig(p_pnl.cum_cost), 
+                            round_sigfig(p_pnl.transacted_value),
+                            )
                         )
-                    )
-        elif od_dt <= fd_dt: # process trade
 
-            event_type = ['orda']
-            noda = next(oit)[1]
+        elif od_dt <= fd_dt: # process trade
+            # event_type = ['orda']
             last_dt = od_dt
+
+            noda = next(oit)[1]
             od_dt = oit.peek(end)[0] 
             
             pos_delta = noda[0]
             assert(pos_delta != Decimal(0))
 
-            mtm = noda[1]
-            assert(mtm != Decimal(0))
+            product_id = noda[2]
+            assert (product_id)
 
-            trade_in_same_direction = sign(pnl.cum_units + pos_delta) == sign(pnl.cum_units)
+            if product_id in product_perf:                
+                p_pnl = product_perf[product_id]
+            else:
+                product_perf[product_id] = pnl_tracker()
+                p_pnl = product_perf[product_id]
+                p_pnl.unit_ccy = product_static[str(product_id)]['base']
+                p_pnl.pnl_ccy = product_static[str(product_id)]['quoted']
+
+            trade_in_same_direction = sign(p_pnl.cum_units + pos_delta) == sign(p_pnl.cum_units)
+ 
+            if p_pnl.pnl_ccy == portfolio_ccy:
+                portfolio_close -= p_pnl.cum_pnl
+            else:
+                # FIXME
+                # use fx conversion rate to convert p_pnl.cum_pnl from p_pnl.pnl_ccy to portfolio_ccy
+                fx_conv_rate = Decimal(1.0)
+                portfolio_close -= fx_conv_rate * p_pnl.cum_pnl
+
 
             if trade_in_same_direction:
-                process_order(pnl, noda)
- 
-                realised_pnl += pnl.realised_pnl
-                potential_pnl = pnl.potential_pnl
+                process_order(p_pnl, noda)
+
             else: # net out
 
                 oda_copy = noda.copy()
 
                 # TODO consider reflecting closed position as cashflow
-                units_closed = -pnl.cum_units
-                units_left = pos_delta + pnl.cum_units
+                units_closed = -p_pnl.cum_units
+                units_left = pos_delta + p_pnl.cum_units
 
                 oda_copy[0] = units_closed
-                process_order(pnl, oda_copy)
-                realised_pnl += pnl.realised_pnl
-
+                process_order(p_pnl, oda_copy)
+               
                 oda_copy[0] = units_left 
-                process_order(pnl, oda_copy)
-                assert(pnl.realised_pnl == Decimal(0))
-                potential_pnl = pnl.potential_pnl
+                process_order(p_pnl, oda_copy)
 
-            cum_pnl = realised_pnl + potential_pnl
- 
+            cum_pnl = p_pnl.cum_pnl
+
+            if p_pnl.pnl_ccy == portfolio_ccy:
+                portfolio_close += p_pnl.cum_pnl
+            else:
+                # FIXME
+                # use fx conversion rate to convert p_pnl.cum_pnl from p_pnl.pnl_ccy to portfolio_ccy
+                fx_conv_rate = Decimal(1.0)
+                portfolio_close += fx_conv_rate * p_pnl.cum_pnl
+
+
+            portfolio_low = min(portfolio_low, portfolio_close)
+            portfolio_high = max(portfolio_high, portfolio_close)               
+
+            if product_id in product_ohlc:
+                ohlc = product_ohlc[product_id]
+                ohlc.pnl_high = max(ohlc.pnl_high, cum_pnl)
+                ohlc.pnl_low = min(ohlc.pnl_low, cum_pnl)
+                ohlc.pnl_close = cum_pnl
+
+                ohlc.px_high = max(ohlc.px_high, p_pnl.mtm)
+                ohlc.px_low = min(ohlc.px_low, p_pnl.mtm)
+                ohlc.px_close = p_pnl.mtm
+            else:       
+                product_ohlc[product_id] = perf_ohlc()
+                ohlc = product_ohlc[product_id]
+                ohlc.pnl_open = cum_pnl
+                ohlc.pnl_high = cum_pnl
+                ohlc.pnl_low = cum_pnl
+                ohlc.pnl_close = cum_pnl
+                ohlc.px_open = p_pnl.mtm
+                ohlc.px_high = p_pnl.mtm
+                ohlc.px_low = p_pnl.mtm
+                ohlc.px_close = p_pnl.mtm 
+
             if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
                 print("oda {} px {} adj_pnl {:f} cum_pnl {} cum_units {:f} real {} potential {} prev_units {:f} cost_of_transaction {} cum_cost {} transacted_value {} pos_delta {:f}".format(
                     last_dt, 
-                    round_sigfig(mtm,6),
-                    round_sigfig(cum_pnl / abs(pnl.cum_units)) if pnl.cum_units != 0 else 0,
+                    round_sigfig(p_pnl.mtm,6),
+                    round_sigfig(cum_pnl / abs(p_pnl.cum_units)) if p_pnl.cum_units != 0 else 0,
                     round_sigfig(cum_pnl, 3),
-                    round_sigfig(pnl.cum_units,3),
-                    realised_pnl,
-                    potential_pnl,
-                    round_sigfig(pnl.prev_units,3), 
-                    round_sigfig(pnl.cost_of_transaction), 
-                    round_sigfig(pnl.cum_cost), 
-                    round_sigfig(pnl.transacted_value),
-                    round_sigfig(pos_delta,3),
+                    round_sigfig(p_pnl.cum_units, 3),
+                    p_pnl.realised_pnl,
+                    p_pnl.potential_pnl,
+                    round_sigfig(p_pnl.prev_units, 3), 
+                    round_sigfig(p_pnl.cost_of_transaction), 
+                    round_sigfig(p_pnl.cum_cost), 
+                    round_sigfig(p_pnl.transacted_value),
+                    round_sigfig(pos_delta, 3),
                     )
                 )
              
         else: # process cashflow
-            event_type = ['xfer']
+            # event_type = ['xfer']
             # Rn = (Equity at the end of the sub-period – Equity at the beginning of the sub-period – Deposits + Withdrawals) / Equity at the beginning of the sub-period
 
             fd = next(fit)[1]
             last_dt = fd_dt
 
-            balance += fd[0]
+            ccy = fd[0]
+            qty = Decimal(fd[1])
+
+            if ccy not in asset:
+                asset[ccy] = Decimal(0)
+            asset[ccy] = asset[ccy] + qty
+            
+            balance_data.append([last_dt, ccy, asset[ccy]])
+
+            if fd[0] == Decimal(0):
+                asset.pop(ccy)
+            
             fd_dt = fit.peek(end)[0]
+
+        if last_bar == 0:
+            last_bar = int(last_dt//60)
 
         next_dt = min(px_dt, od_dt, fd_dt)
 
-        if last_dt < next_dt: # close of timepoint
+        next_bar = int(next_dt//60)
 
-            account_value = balance + realised_pnl + potential_pnl
+        if last_bar != next_bar: # close bar
+            last_bar = next_bar
 
-            roi = [realised_pnl, potential_pnl, balance, account_value]
+            roi = [asset, round_sigfig(portfolio_open, 3), portfolio_high, portfolio_low, portfolio_close]
+            issame = (roi == last_roi) #only record entry if change occurred
+            if not issame: 
+                if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
+                    print("asset {} equity {}".format(asset, portfolio_close))
+     
+                data.append([last_dt, None, None, None, None, None, None, None, None, portfolio_ccy, portfolio_open, portfolio_high, portfolio_low, portfolio_close])
+                for product_id, ohlc in product_ohlc.items():
+                    p_pnl = product_perf[product_id]
+                    # FIXME
+                    # convert from p_pnl.pnl_ccy to portfolio_ccy for ohlc values
+                    #    ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close
 
-            if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
-                print("roi {} next_roi {} balance {} unrealised {}".format(roi, last_roi, balance, Decimal(abs(pnl.cum_units) * mtm)))
-            
-            if roi != last_roi or event_type == ['orda']:
-                data.append([last_dt, mtm, pnl.cost_basis, pnl.cum_units] + roi)
-                last_roi = [] + roi #induce copy
+                    data.append([last_dt, product_id, ohlc.px_open, ohlc.px_high, ohlc.px_low, ohlc.px_close, p_pnl.cost_basis, p_pnl.unit_ccy, p_pnl.cum_units, p_pnl.pnl_ccy, ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close])
 
-            last_dt = next_dt
+                last_roi = [] + roi
+                product_ohlc.clear()
+
+                # we must reset porfolio values 
+                portfolio_open = portfolio_close
+                portfolio_high = portfolio_close
+                portfolio_low = portfolio_close                
+               
+
+#    if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
+#        print("roi {} next_roi {} balance {} unrealised {}".format(roi, last_roi, balance, Decimal(abs(pnl.cum_units) * mtm)))
+    
+    if roi != last_roi:
+        if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
+            print("roi {}".format(roi))
+
+        data.append([last_dt, None, None, None, None, None, None, None, None, portfolio_ccy, portfolio_open, portfolio_high, portfolio_low, portfolio_close])
+        for product_id, ohlc in product_ohlc.items():
+            p_pnl = product_perf[product_id]
+            data.append([last_dt, product_id, ohlc.px_open, ohlc.px_high, ohlc.px_low, ohlc.px_close, p_pnl.cost_basis, p_pnl.unit_ccy, p_pnl.cum_units, p_pnl.pnl_ccy, ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close])
+
+        last_roi = [] + roi
+        product_ohlc.clear()
+
+        # for fairness we set close to the last open
+        portfolio_open = portfolio_close
+
+        # we must reset porfolio values 
+        portfolio_open = portfolio_close
+        portfolio_high = portfolio_close
+        portfolio_low = portfolio_close 
     
         #         r_est = (emv - bmv - balance_adj)/(bmv + balance_adj)
         #         print (bmv + balance_adj*(1 + r_est))
@@ -310,16 +497,29 @@ def walkforward(args=None):
         #         print("cash {} r_est {} bmv {} emv {}".format(last_dt, r_est*100, bmv, emv))
 
     if args.writer: 
-        os.makedirs(os.path.dirname(args.csv), exist_ok=True)
-        with open(args.csv, 'w', newline='') as csvfile:
+        os.makedirs(os.path.dirname(args.report_csv), exist_ok=True)
+        with open(args.report_csv, 'w', newline='') as csvfile:
             pnlwriter = csv.writer(csvfile, delimiter='\t', 
                         quotechar='|', quoting=csv.QUOTE_MINIMAL)
-            pnlwriter.writerow(["Date", "Price", "Cost Basis", "NOP", "Realised Pnl", "Potential Pnl", "Balance", "Account Value"])
+            pnlwriter.writerow(["epoch", "product_id", "open_px", "high_px", "low_px", "close_px", "cost_basis", "unit_ccy", "nop", "pnl_ccy", "open_pnl", "high_pnl", "low_pnl", "close_pnl"])
+ 
             for x in data:
                 pnlwriter.writerow(x)
+
         print("wrote report {}".format(csvfile))
 
-    return data[-1]
+        os.makedirs(os.path.dirname(args.balance_csv), exist_ok=True)
+        with open(args.balance_csv, 'w', newline='') as csvfile:
+            pnlwriter = csv.writer(csvfile, delimiter='\t', 
+                        quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            pnlwriter.writerow(["epoch", "ccy", "qty"])
+ 
+            for x in balance_data:
+                pnlwriter.writerow(x)
+
+        print("wrote report {}".format(csvfile))
+
+    return [asset.copy(), product_perf.copy()]
 
     # perf = df['Returns'].calc_stats() 
     # perf.display() 
@@ -347,8 +547,10 @@ def parse_args(pargs=None):
     #     and (buy_trader_id = 401130 or sell_trader_id = 401130)
     #     and (buy_trader_id <> sell_trader_id) 
     #     and created_at > (select max(updated_at) from import_from_quoine_main.pg_balances where user_id = 401130)
-    # order by id asc;
-    parser.add_argument('--data1', default='sample/trades.csv',
+    # order by id asc
+    # limit 200
+    # ;
+    parser.add_argument('--data1', default='sample/trades.in.csv',
                         required=False, help='Data to read in')
 
     # select 
@@ -371,8 +573,11 @@ def parse_args(pargs=None):
                         nargs='?', const='{}',
                         metavar='kwargs', help='kwargs in key=value format')
 
-    parser.add_argument('--opening_balance', type=Decimal, required=False, default='Nan',
+    parser.add_argument('--opening_balance', type=json.loads, required=False,
                         help='Real number')
+
+    parser.add_argument('--product_static_json', default='sample/product.in.json', required=False,
+                        help=('Json dict of product static data'))
 
     # parser.add_argument('--timeframe', default='minutes', required=False,
     #                     choices=['ticks', 'microseconds', 'seconds',
@@ -385,8 +590,14 @@ def parse_args(pargs=None):
     parser.add_argument('--writer', required=False, action='store_true',
                         help=('Add a Writer'))
 
-    parser.add_argument('--csv', default='output/report.csv', required=False,
-                        help=('Output to csv'))
+    parser.add_argument('--report_csv', default='output/report.out.csv', required=False,
+                        help=('Output perform data to csv'))
+
+    parser.add_argument('--balance_csv', default='output/balance.out.csv', required=False,
+                        help=('Output balance data to csv'))
+
+    parser.add_argument('--portfolio_ccy', default='JPY', required=False,
+                        help=('Output balance data to csv'))
 
     return parser.parse_args(pargs)
 
