@@ -15,6 +15,7 @@ from __future__ import (absolute_import, division, print_function,
 from datetime import datetime
 from decimal import Decimal
 from more_itertools import peekable
+from collections import deque
 
 import datetime
 import decimal
@@ -79,6 +80,8 @@ class perf_ohlc:
         self.px_low = Decimal('Nan')
         self.px_close = Decimal('Nan')
         self.trade_cnt = 0
+        self.win = 0
+        self.loss = 0
 
 
 def init_perf_ohlc(ohlc, units_val, pnl_val, px_val):
@@ -95,22 +98,24 @@ def init_perf_ohlc(ohlc, units_val, pnl_val, px_val):
     ohlc.px_low = px_val
     ohlc.px_close = px_val
     ohlc.trade_cnt = 0
+    ohlc.win = 0
+    ohlc.loss = 0
 
-def update_perf_ohlc(ohlc, units_val, pnl_val, px_val):
-    if ohlc.units_close != units_val:
-        ohlc.trade_cnt = ohlc.trade_cnt + 1
-    ohlc.units_high = max(ohlc.units_high, units_val)
-    ohlc.units_low = min(ohlc.units_low, units_val)
-    ohlc.units_close = units_val
-    ohlc.pnl_high = max(ohlc.pnl_high, pnl_val)
-    ohlc.pnl_low = min(ohlc.pnl_low, pnl_val)
-    ohlc.pnl_close = pnl_val
-    ohlc.px_high = max(ohlc.px_high, px_val)
-    ohlc.px_low = min(ohlc.px_low, px_val)
-    ohlc.px_close = px_val
+def update_perf_ohlc(ohlc, pnl):
+    ohlc.units_high = max(ohlc.units_high, pnl.cum_units)
+    ohlc.units_low = min(ohlc.units_low, pnl.cum_units)
+    ohlc.units_close = pnl.cum_units
+    ohlc.pnl_high = max(ohlc.pnl_high, pnl.cum_pnl)
+    ohlc.pnl_low = min(ohlc.pnl_low, pnl.cum_pnl)
+    ohlc.pnl_close = pnl.cum_pnl
+    ohlc.px_high = max(ohlc.px_high, pnl.mtm)
+    ohlc.px_low = min(ohlc.px_low, pnl.mtm)
+    ohlc.px_close = pnl.mtm
+    ohlc.win = pnl.gainers
+    ohlc.loss = pnl.losers
+    ohlc.trade_cnt = pnl.trade_cnt
 
 def finish_perf_ohlc(ohlc):
-    ohlc.trade_cnt = 0
     ohlc.units_open = ohlc.units_close
     ohlc.units_high = ohlc.units_close
     ohlc.units_low = ohlc.units_close
@@ -120,7 +125,15 @@ def finish_perf_ohlc(ohlc):
     ohlc.px_open = ohlc.px_close
     ohlc.px_high = ohlc.px_close
     ohlc.px_low = ohlc.px_close
+    ohlc.trade_cnt = 0
+    ohlc.win = 0
+    ohlc.loss = 0
 
+
+class position:
+   def __init__(   self):
+       self.cost_basis = Decimal('Nan')
+       self.units = Decimal(0.0)
 
 class pnl_tracker:
     def __init__(   self):
@@ -133,13 +146,24 @@ class pnl_tracker:
         self.cum_units = Decimal(0.0)
         self.transacted_value = Decimal(0.0)
         self.cost_of_transaction = Decimal(0.0)
+        self.prev_cum_pnl = Decimal(0.0)
         self.cum_pnl = Decimal(0.0)
         self.unit_ccy = str()
         self.pnl_ccy = str()
+        self.trade_cnt = 0
+        self.gainers = 0
+        self.losers = 0
+        self.positions = deque()
 
-def process_order(pnl, oda):
+def reset_pnl_tracker_stats(pnl):
+    pnl.trade_cnt = 0
+    pnl.gainers = 0
+    pnl.losers = 0
+
+def process_order(pnl, oda, partial = False):
 
     pos_delta = oda[0]
+    assert(pos_delta != Decimal(0))
     pnl.mtm = oda[1]
     assert(pnl.mtm != Decimal(0) and not pnl.mtm.is_nan())
 
@@ -154,14 +178,46 @@ def process_order(pnl, oda):
 
     pnl.transacted_value = pos_delta * pnl.cost_basis - fees
 
-    if pnl.prev_units == 0:
+    if pnl.prev_units == Decimal(0):
+        assert(len(pnl.positions) == 0)
         pnl.cost_basis = pnl.mtm #Decimal(0)
+
     elif trade_in_same_direction: 
         if increase_position:
             pnl.cost_basis = (pnl.cost_basis * abs(pnl.prev_units) + pnl.mtm * abs(pos_delta)) / abs(pnl.cum_units)
         # else: #do nothing
     else:
         pnl.cost_basis = pnl.mtm
+
+    if not partial:
+        pnl.trade_cnt += 1
+    # We maintain a fifo queue of open positions
+    # With each new trade we try and close out one or more existing positions
+    # Win/loss is only considered for fully closed out positions
+    # It isn't the most robust metric ¯\_(ツ)_/¯
+    pos_delta_left = pos_delta
+    while pos_delta_left != Decimal(0) and len(pnl.positions) > 0:
+        pos = pnl.positions.popleft()
+        net_units = Decimal(sign(-pos.units)) * min(abs(pos_delta_left),abs(pos.units))
+        pos_delta_left -= net_units
+
+        pos.units += net_units
+        if pos.units != Decimal(0):
+            pnl.positions.appendleft(pos)
+            break
+        else:
+            if pos.cost_basis != pnl.mtm:
+                if (sign(pos.units) != 1) ^ (sign(pos_delta) != 1) ^ (pos.cost_basis < pnl.mtm):
+                    pnl.losers += 1
+                else:
+                    pnl.gainers += 1
+
+
+    if pos_delta_left != Decimal(0):
+        pos = position()
+        pos.cost_basis = pnl.cost_basis
+        pos.units = pos_delta_left
+        pnl.positions.append(pos)
 
     pnl.cost_of_transaction = pos_delta * pnl.mtm + fees
 
@@ -174,10 +230,6 @@ def process_order(pnl, oda):
 
     pnl.cum_pnl = pnl.realised_pnl + pnl.potential_pnl
 
-    if pnl.cum_units == Decimal(0):
-        pnl.cost_basis = Decimal('Nan')
- 
-    #print("cost basis {}, cost_of_trans = {} pnl.transacted_value {} pnl.cum_units {} prev_units {} mtm {} trade_in_same_direction {}".format(pnl.cost_basis,pnl.cost_of_transaction, pnl.transacted_value, pnl.cum_units, pnl.prev_units, mtm, trade_in_same_direction))
 
 def walkforward(args=None):
     args = parse_args(args)
@@ -253,13 +305,12 @@ def walkforward(args=None):
     oit = peekable(trades.iterrows())
     fit = peekable(funding.iterrows())
    
-    end = [sys.maxsize,0,0,5]
+    end = [sys.maxsize]
  
     data = []
     balance_data = []
     last_roi = []
 
-    #first_dt = 0
     last_dt = 0
     px_dt = dit.peek(end)[0]
     od_dt = oit.peek(end)[0]
@@ -275,6 +326,7 @@ def walkforward(args=None):
     portfolio_close = Decimal(0)
 
     last_bar = 0
+    first_dt = 0
 
     while px_dt != end[0] or od_dt != end[0] or fd_dt != end[0]:
         
@@ -292,6 +344,7 @@ def walkforward(args=None):
        
                 p_pnl = product_perf[product_id]
                 if p_pnl.cum_units != 0:
+
                     #FIXME improve accuracy by looking up price by size market data feed
                     #methodology must be consistent with walk backward
                     p_pnl.mtm = md[0]
@@ -311,7 +364,7 @@ def walkforward(args=None):
                     # ohlc created upon opening the position
                     #  have been created when the position 
                     ohlc = product_ohlc[product_id]
-                    update_perf_ohlc(ohlc, p_pnl.cum_units, p_pnl.cum_pnl, p_pnl.mtm)
+                    update_perf_ohlc(ohlc, p_pnl)
                     
                     if p_pnl.pnl_ccy == portfolio_ccy:
                         portfolio_close += p_pnl.cum_pnl
@@ -381,13 +434,14 @@ def walkforward(args=None):
                 units_closed = -p_pnl.cum_units
                 units_left = pos_delta + p_pnl.cum_units
 
-                oda_copy[0] = units_closed
-                process_order(p_pnl, oda_copy)
+                if units_closed != 0:
+                    oda_copy[0] = units_closed
+                    process_order(p_pnl, oda_copy, False)
                
-                oda_copy[0] = units_left 
-                process_order(p_pnl, oda_copy)
+                if units_left != 0:
+                    oda_copy[0] = units_left 
+                    process_order(p_pnl, oda_copy)
 
- 
             if p_pnl.pnl_ccy == portfolio_ccy:
                 portfolio_close += p_pnl.cum_pnl
             else:
@@ -402,13 +456,13 @@ def walkforward(args=None):
 
             if product_id in product_ohlc:
                 ohlc = product_ohlc[product_id]
-                update_perf_ohlc(ohlc, p_pnl.cum_units, p_pnl.cum_pnl, p_pnl.mtm)
+                update_perf_ohlc(ohlc, p_pnl)
 
             else:       
                 product_ohlc[product_id] = perf_ohlc()
                 ohlc = product_ohlc[product_id]
                 init_perf_ohlc(ohlc, 0, 0, p_pnl.mtm)
-                update_perf_ohlc(ohlc, p_pnl.cum_units, p_pnl.cum_pnl, p_pnl.mtm)
+                update_perf_ohlc(ohlc, p_pnl)
  
 
             if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
@@ -449,7 +503,9 @@ def walkforward(args=None):
             
             fd_dt = fit.peek(end)[0]
 
+
         if last_bar == 0:
+            first_dt = last_dt
             last_bar = int(last_dt//60)
 
         next_dt = min(px_dt, od_dt, fd_dt)
@@ -457,14 +513,20 @@ def walkforward(args=None):
         next_bar = int(next_dt//60)
 
         if last_bar != next_bar: # close bar
-            last_bar = next_bar
+            roi = [asset, portfolio_close]
 
-            roi = [asset, portfolio_open, portfolio_high, portfolio_low, portfolio_close]
-            issame = (roi == last_roi) #only record entry if change occurred
-            if not issame: 
+            issame = (roi == last_roi) and portfolio_high == portfolio_close and portfolio_low == portfolio_close
+            #only record entry if change occurred
+            if not issame:
+                last_bar = 0
                 if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
                     print("roi {} last_roi {}".format(roi, last_roi))
      
+                bar_start = first_dt
+                bar_duration = max(last_dt - bar_start, 1) #60 if next_dt != end[0] else last_dt - last_bar * 60
+
+                win = 0
+                loss = 0
                 trade_cnt = 0
                 for product_id, ohlc in product_ohlc.items():
                     p_pnl = product_perf[product_id]
@@ -472,13 +534,16 @@ def walkforward(args=None):
                     # convert from p_pnl.pnl_ccy to portfolio_ccy for ohlc values
                     #    ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close
 
+                    win += ohlc.win
+                    loss += ohlc.loss
                     trade_cnt += ohlc.trade_cnt
-                    data.append([last_dt, product_id, ohlc.px_open, ohlc.px_high, ohlc.px_low, ohlc.px_close, p_pnl.cost_basis, p_pnl.unit_ccy, ohlc.units_open, ohlc.units_high, ohlc.units_low, ohlc.units_close, ohlc.trade_cnt, p_pnl.pnl_ccy, ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close])
+                    data.append([bar_start, bar_duration, product_id, ohlc.px_open, ohlc.px_high, ohlc.px_low, ohlc.px_close, p_pnl.cost_basis, p_pnl.unit_ccy, ohlc.units_open, ohlc.units_high, ohlc.units_low, ohlc.units_close, ohlc.trade_cnt, ohlc.win, ohlc.loss, p_pnl.pnl_ccy, ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close])
                     finish_perf_ohlc(ohlc)
 
-                data.append([last_dt, None, None, None, None, None, None, None, None, None, None, None, trade_cnt, portfolio_ccy, portfolio_open, portfolio_high, portfolio_low, portfolio_close])
+                data.append([bar_start, bar_duration, None, None, None, None, None, None, None, None, None, None, None, trade_cnt, win, loss, portfolio_ccy, portfolio_open, portfolio_high, portfolio_low, portfolio_close])
 
                 for product_id, p_pnl in product_perf.items():
+                    reset_pnl_tracker_stats(p_pnl)
                     if product_id in product_ohlc and p_pnl.cum_units == Decimal(0):
                         del product_ohlc[product_id]
 
@@ -490,26 +555,33 @@ def walkforward(args=None):
                 # we must reset porfolio values 
                 portfolio_high = portfolio_close
                 portfolio_low = portfolio_close                
-               
 
 #    if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
 #        print("roi {} next_roi {} balance {} unrealised {}".format(roi, last_roi, balance, Decimal(abs(pnl.cum_units) * mtm)))
     
     if roi != last_roi:
+        bar_start = first_dt
+
         if logging.DEBUG >= logging.getLogger().getEffectiveLevel(): 
             print("roi {}".format(roi))
    
+        bar_duration = max(last_dt - bar_start, 1) #60 if next_dt != end[0] else last_dt - last_bar * 60
+
         trade_cnt = 0
+        win = 0
+        loss = 0
         for product_id, ohlc in product_ohlc.items():
             p_pnl = product_perf[product_id]
             # FIXME
             # convert from p_pnl.pnl_ccy to portfolio_ccy for ohlc values
             #    ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close
             trade_cnt += ohlc.trade_cnt
-            data.append([last_dt, product_id, ohlc.px_open, ohlc.px_high, ohlc.px_low, ohlc.px_close, p_pnl.cost_basis, p_pnl.unit_ccy, ohlc.units_open, ohlc.units_high, ohlc.units_low, ohlc.units_close, ohlc.trade_cnt, p_pnl.pnl_ccy, ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close])
+            win += ohlc.win
+            loss += ohlc.loss
+            data.append([bar_start, bar_duration, product_id, ohlc.px_open, ohlc.px_high, ohlc.px_low, ohlc.px_close, p_pnl.cost_basis, p_pnl.unit_ccy, ohlc.units_open, ohlc.units_high, ohlc.units_low, ohlc.units_close, ohlc.trade_cnt, ohlc.win, ohlc.loss, p_pnl.pnl_ccy, ohlc.pnl_open, ohlc.pnl_high, ohlc.pnl_low, ohlc.pnl_close])
             finish_perf_ohlc(ohlc)
 
-        data.append([last_dt, None, None, None, None, None, None, None, None, None, None, None, trade_cnt, portfolio_ccy, portfolio_open, portfolio_high, portfolio_low, portfolio_close])
+        data.append([bar_start, bar_duration, None, None, None, None, None, None, None, None, None, None, None, trade_cnt, win, loss, portfolio_ccy, portfolio_open, portfolio_high, portfolio_low, portfolio_close])
 
         for product_id, p_pnl in product_perf.items():
             if product_id in product_ohlc and p_pnl.cum_units == Decimal(0):
@@ -538,7 +610,7 @@ def walkforward(args=None):
         with open(args.report_csv, 'w', newline='') as csvfile:
             pnlwriter = csv.writer(csvfile, delimiter='\t', 
                         quotechar='|', quoting=csv.QUOTE_MINIMAL)
-            pnlwriter.writerow(["epoch", "product_id", "open_px", "high_px", "low_px", "close_px", "cost_basis", "unit_ccy", "open_nop", "high_nop", "low_nop", "close_nop", "trade_cnt", "pnl_ccy", "open_pnl", "high_pnl", "low_pnl", "close_pnl"])
+            pnlwriter.writerow(["epoch", "duration", "product_id", "open_px", "high_px", "low_px", "close_px", "cost_basis", "unit_ccy", "open_nop", "high_nop", "low_nop", "close_nop", "trade_cnt", "win","loss","pnl_ccy", "open_pnl", "high_pnl", "low_pnl", "close_pnl"])
  
             for x in data:
                 pnlwriter.writerow(x)

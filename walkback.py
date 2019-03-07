@@ -7,8 +7,12 @@ Starting with a recent snaphot of account value and open positions, we walk back
 replaying market events to reconstruct the trader's pnl profile. In the walk backwards run we
 focus on collecting product level data, rather than portfolio statistics.
 
+wrote report <_io.TextIOWrapper name='output/report.out.csv' mode='w' encoding='UTF-8'>
+wrote report <_io.TextIOWrapper name='output/balance.out.csv' mode='w' encoding='UTF-8'>
+Backward and forward walk within tolerance! (0.001%)
+
 FIXME fixup todate and fromdate handling to limit how far we go back in history (maybe rely min distance, limited by CPU time)
-    
+FIXME correct mark-to-market (mtm) by using price by size
 """
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
@@ -75,19 +79,6 @@ class DecimalEncoderWithPossiblePrecisionLoss(json.JSONEncoder):
             return float(o)
         return super(DecimalEncoderWithPossiblePrecisionLoss, self).default(o)
 
-class pnl_tracker:
-    def __init__(   self):
-        self.mtm = Decimal('Nan')
-        self.potential_pnl = Decimal(0.0)
-        self.cum_cost = Decimal(0.0)
-        self.cost_basis = Decimal('Nan')
-        self.realised_pnl = Decimal(0.0)
-        self.prev_units = Decimal(0.0)
-        self.cum_units = Decimal(0.0)
-        self.transacted_value = Decimal(0.0)
-        self.cost_of_transaction = Decimal(0.0)
-        self.cum_pnl = Decimal(0.0)
-
 
 def walkbackward(args=None):
     args = parse_args(args)
@@ -138,7 +129,7 @@ def walkbackward(args=None):
         trades = trades[trades.index.searchsorted(fromtimestamp):]
         funding = funding[funding.index.searchsorted(fromtimestamp):]
     
-    end = [-sys.maxsize,0,0,5]
+    end = [-sys.maxsize]
 
     data = []
     balance_data = []
@@ -191,7 +182,7 @@ def walkbackward(args=None):
             if product_id in product_perf:                
                 p_pnl = product_perf[product_id]
             else:
-                product_perf[product_id] = pnl_tracker()
+                product_perf[product_id] = bt.pnl_tracker()
                 p_pnl = product_perf[product_id]
 
             trade_in_same_direction = sign(p_pnl.cum_units + pos_delta) == sign(p_pnl.cum_units)
@@ -206,11 +197,13 @@ def walkbackward(args=None):
                 units_closed = -p_pnl.cum_units
                 units_left = pos_delta + p_pnl.cum_units
 
-                oda_copy[0] = units_closed
-                bt.process_order(p_pnl, oda_copy)
+                if units_closed != 0:
+                    oda_copy[0] = units_closed
+                    bt.process_order(p_pnl, oda_copy, False)
 
-                oda_copy[0] = units_left 
-                bt.process_order(p_pnl, oda_copy)
+                if units_left != 0:
+                    oda_copy[0] = units_left
+                    bt.process_order(p_pnl, oda_copy)
 
             cum_pnl = p_pnl.cum_pnl
  
@@ -321,7 +314,7 @@ def walkbackward(args=None):
         issame = issame and math.isclose(simulated_closing_balance[ccy], closing_balance[ccy], rel_tol = threshold)
 
     if not issame:
-        print("Backward ({}) and forward walk ({}) different :-(".format(closing_balance, simulated_closing_balance))
+        print("Backward ({}) and forward walk ({}) substantially different :-(".format(closing_balance, simulated_closing_balance))
     else:
         print("Backward and forward walk within tolerance! ({}%)".format(threshold* 100))
 
