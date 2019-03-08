@@ -1,21 +1,20 @@
 -- liquid vision database entities
 
-drop table public.lv_usd_conv_rate;
+drop table IF EXISTS public.lv_usd_conv_rate;
 CREATE TABLE public.lv_usd_conv_rate (
     ts timestamp NOT NULL,
     lhs_ccy text NOT NULL,
     rhs_ccy text NOT NULL,
-    rate real NOT NULL,
+    rate real NOT NULL
 );
 
 
-drop index ix_lv_usd_conv_rate;
+drop index IF exists ix_lv_usd_conv_rate;
 CREATE UNIQUE INDEX ix_lv_usd_conv_rate ON public.lv_usd_conv_rate(ts, lhs_ccy, rhs_ccy);
 
 
-drop function lv_usd_conversion_rate;
 -- only fx rates in the form USD/CCY are considered
-create function lv_usd_conversion_rate(
+create or replace function lv_usd_conversion_rate(
    asof timestamp,
    ccy_from text,
    ccy_to text) 
@@ -59,7 +58,7 @@ limit 1
 $$ language sql;
 
 
-drop table public.lv_trader_perf;
+drop table if exists public.lv_trader_perf cascade;
 CREATE TABLE public.lv_trader_perf (
     id bigserial PRIMARY KEY,
 	epoch int4 NOT NULL,
@@ -90,7 +89,7 @@ CREATE TABLE public.lv_trader_perf (
 	pnl_close real NOT null default 0
 );
 
-drop view public.v_lv_trader_perf;
+drop view if exists public.v_lv_trader_perf;
 CREATE VIEW public.v_lv_trader_perf AS select
 	epoch,
 	0::int4 whence,
@@ -119,7 +118,7 @@ order by
 ;
 
 
-drop index ix_lv_trader_perf;
+drop index if exists ix_lv_trader_perf;
 CREATE INDEX ix_lv_trader_perf ON public.lv_trader_perf(user_id, epoch, product_id);
 
 drop domain report_limit;
@@ -127,8 +126,7 @@ create domain report_limit as integer
 -- reject requests  
 check (value >= 0 and value <= 367*24);
 
-drop function lv_date_boundary;
-create function lv_date_boundary(userid text, start_dt timestamp, period interval) returns timestamp with time zone as $$
+create or replace function lv_date_boundary(userid text, start_dt timestamp, period interval) returns timestamp with time zone as $$
 	select case when (period < interval '0') then least(start_dt, to_timestamp(max(epoch))) 
 				else greatest(start_dt, to_timestamp(min(epoch))) 
 			end 	
@@ -137,8 +135,7 @@ create function lv_date_boundary(userid text, start_dt timestamp, period interva
 $$ language sql;
 
 		
-drop function lv_trader_perf_over_time;
-create
+create or replace
 	function lv_trader_perf_over_time(userid text,
 	from_dt timestamp,
 	to_dt timestamp,
@@ -209,7 +206,7 @@ create
 $$ language sql;
 
 
-drop table public.lv_trader_balance;
+drop table if exists public.lv_trader_balance cascade;
 CREATE TABLE public.lv_trader_balance (
     id bigserial PRIMARY KEY,
 	user_id text NOT NULL,
@@ -218,7 +215,7 @@ CREATE TABLE public.lv_trader_balance (
 	units real null default 0
 );
 
-drop view public.v_lv_trader_balance;
+drop view if exists public.v_lv_trader_balance;
 CREATE VIEW public.v_lv_trader_balance AS SELECT 
 	epoch,
 	0::int4 whence,
@@ -233,18 +230,17 @@ CREATE VIEW public.v_lv_trader_balance AS SELECT
 	null::real as fx_rate,
 	user_id
 from 
-	public.lv_trader_balance;
+	public.lv_trader_balance
 order by
 	epoch,
 	asset 
 ;
 
-drop index ix_lv_trader_balance;
+drop index if exists ix_lv_trader_balance;
 CREATE INDEX ix_lv_trader_balance ON public.lv_trader_balance(user_id, epoch);
 
 -- query balance
-drop function lv_trader_balance_over_time;
-create
+create or replace
 	function lv_trader_balance_over_time(userid text,
 	from_dt timestamp,
 	to_dt timestamp,
