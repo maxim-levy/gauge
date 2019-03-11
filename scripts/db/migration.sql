@@ -154,8 +154,8 @@ create or replace
 	limit greatest( abs((extract('epoch' from (to_dt - from_dt))::int/extract('epoch' from period::interval)::int))::report_limit, 367*24)
   ) select
   		t,
-		(y_first).epoch,
-		greatest(d, (y_last).epoch + (y_last).duration) - (y_first).epoch,
+		y_earliest,
+		y_latest - y_earliest,
 		product_id::int4,
 		userid as user_id,
 		nop_ccy,
@@ -180,6 +180,8 @@ create or replace
 			x.t2::int4 as d,
 			first_value(y) over w as y_first,
 			last_value(y) over w as y_last,
+			min(y.epoch + y.duration) over w as y_earliest,
+			max(y.epoch + y.duration) over w as y_latest,
 			sum(y.trade_cnt) over w as trade_cnt,
 			sum(y.win) over w as win,
 			sum(y.loss) over w as loss,
@@ -276,6 +278,8 @@ create or replace
 			x.t2::int4 as d ,
 			first_value(y) over w as y_first ,
 			last_value(y) over w as y_last ,
+			min(y.epoch + y.duration) over w as y_earliest,
+			max(y.epoch + y.duration) over w as y_latest,
 			sum(xfer_cnt) over w as xfer_cnt ,
 			first_value(units_open) over w as open ,
 			max(units_high) over w as units_max ,
