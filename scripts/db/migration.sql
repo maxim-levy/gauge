@@ -162,7 +162,7 @@ create or replace
 		(y_first).nop_open,
 		nop_max,
 		nop_min,
-		(y_first).nop_close,
+		(y_last).nop_close,
 		trade_cnt::int4,
 		win::int4,
 		loss::int4,
@@ -170,7 +170,7 @@ create or replace
 		rate * (y_first).pnl_open,
 		rate * pnl_max,
 		rate * pnl_min,
-		rate * (y_first).pnl_close,
+		rate * (y_last).pnl_close,
 		0.0::real
 	from
 		(
